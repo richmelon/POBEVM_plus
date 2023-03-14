@@ -142,10 +142,12 @@ class Trainer:
         # Matting dataset
         parser.add_argument('--dataset', type=str, default= 'videomatte', choices=['videomatte', 'imagematte'])
         # Learning rate
-        parser.add_argument('--learning-rate-backbone', type=float, default=0.0001)
-        parser.add_argument('--learning-rate-aspp', type=float, default=0.0002)
-        parser.add_argument('--learning-rate-decoder', type=float, default=0.0002)
-        parser.add_argument('--learning-rate-refiner', type=float, default=0)
+        parser.add_argument('--learning-rate-backbone', type=list, default=[0.0001, 0.00005, 0.00001, 0.00001])
+        parser.add_argument('--learning-rate-aspp', type=list, default=[0.0002, 0.0001, 0.00001, 0.00001])
+        parser.add_argument('--learning-rate-decoder', type=list, default=[0.0002, 0.0001, 0.00001, 0.00005])
+        parser.add_argument('--learning-rate-refiner', type=list, default=[0, 0, 0.0002, 0.0002])
+
+
         # Training setting
         parser.add_argument('--train-hr', action='store_true', default=True)
         parser.add_argument('--resolution-lr', type=int, default=512)
@@ -155,15 +157,20 @@ class Trainer:
         parser.add_argument('--downsample-ratio', type=float, default=0.25)
         parser.add_argument('--batch-size-per-gpu', type=int, default=1)
         parser.add_argument('--num-workers', type=int, default=1)
-        parser.add_argument('--epoch-start', type=int, default=0)
-        parser.add_argument('--epoch-end', type=int, default=20)
+
+        parser.add_argument('--stage', type=int, default=1)
+        parser.add_argument('--stage-start', type=int, default=1)
+        parser.add_argument('--epoch-stage', type=list, default=[0, 20, 22, 23, 28])
+        # parser.add_argument('--epoch-start', type=int, default=0)
+        # parser.add_argument('--epoch-end', type=int, default=20)
+
         # Tensorboard logging
-        parser.add_argument('--log-dir', type=str, default='log/stage1')
+        parser.add_argument('--log-dir', type=str, default='log/stage')
         parser.add_argument('--log-train-loss-interval', type=int, default=20)
         parser.add_argument('--log-train-images-interval', type=int, default=500)
         # Checkpoint loading and saving
         parser.add_argument('--checkpoint', type=str)
-        parser.add_argument('--checkpoint-dir', type=str, default='checkpoint/stage1')
+        parser.add_argument('--checkpoint-dir', type=str, default='checkpoint/stage')
         parser.add_argument('--checkpoint-save-interval', type=int, default=500)
         # Distributed
         parser.add_argument('--distributed-addr', type=str, default='localhost')
@@ -328,7 +335,130 @@ class Trainer:
             num_workers=self.args.num_workers,
             sampler=self.datasampler_seg_video,
             pin_memory=False)
-        
+
+    def _get_dataset(self):
+        self.log(f'get new dataset for stage {self.args.stage}')
+        if self.args.stage == 1 or self.args.stage == 2 or self.args.stage == 3:
+            size_lr = (self.args.resolution_lr, self.args.resolution_lr)
+            if self.args.train_hr:
+                size_hr = (self.args.resolution_hr, self.args.resolution_hr)
+
+            # Init Dataset(dataset = videomatte, resolution_lr = 512, seq_length_lr = 15)
+            self.dataset_lr_train = VideoMatteDataset(
+                videomatte_dir=DATA_PATHS['videomatte']['train'],
+                background_image_dir=DATA_PATHS['background_images']['train'],
+                background_video_dir=DATA_PATHS['background_videos']['train'],
+                size=self.args.resolution_lr,
+                seq_length=self.args.seq_length_lr,
+                seq_sampler=TrainFrameSampler(),
+                transform=VideoMatteTrainAugmentation(size_lr))
+            if self.args.train_hr:
+                self.dataset_hr_train = VideoMatteDataset(
+                    videomatte_dir=DATA_PATHS['videomatte']['train'],
+                    background_image_dir=DATA_PATHS['background_images']['train'],
+                    background_video_dir=DATA_PATHS['background_videos']['train'],
+                    size=self.args.resolution_hr,
+                    seq_length=self.args.seq_length_hr,
+                    seq_sampler=TrainFrameSampler(),
+                    transform=VideoMatteTrainAugmentation(size_hr))
+            self.dataset_valid = VideoMatteDataset(
+                videomatte_dir=DATA_PATHS['videomatte']['valid'],
+                background_image_dir=DATA_PATHS['background_images']['valid'],
+                background_video_dir=DATA_PATHS['background_videos']['valid'],
+                size=self.args.resolution_hr if self.args.train_hr else self.args.resolution_lr,
+                seq_length=self.args.seq_length_hr if self.args.train_hr else self.args.seq_length_lr,
+                seq_sampler=ValidFrameSampler(),
+                transform=VideoMatteValidAugmentation(size_hr if self.args.train_hr else size_lr))
+
+            # Matting dataloaders:
+            self.datasampler_lr_train = DistributedSampler(
+                dataset=self.dataset_lr_train,
+                rank=self.rank,
+                num_replicas=self.world_size,
+                shuffle=True)
+            self.dataloader_lr_train = DataLoader(
+                dataset=self.dataset_lr_train,
+                batch_size=self.args.batch_size_per_gpu,
+                num_workers=self.args.num_workers,
+                sampler=self.datasampler_lr_train,
+                pin_memory=False)
+            if self.args.train_hr:
+                self.datasampler_hr_train = DistributedSampler(
+                    dataset=self.dataset_hr_train,
+                    rank=self.rank,
+                    num_replicas=self.world_size,
+                    shuffle=True)
+                self.dataloader_hr_train = DataLoader(
+                    dataset=self.dataset_hr_train,
+                    batch_size=self.args.batch_size_per_gpu,
+                    num_workers=self.args.num_workers,
+                    sampler=self.datasampler_hr_train,
+                    pin_memory=False)
+            self.dataloader_valid = DataLoader(
+                dataset=self.dataset_valid,
+                batch_size=self.args.batch_size_per_gpu,  # 1
+                num_workers=self.args.num_workers,
+                pin_memory=False)
+        elif self.args.stage == 4:
+            size_lr = (self.args.resolution_lr, self.args.resolution_lr)
+            if self.args.train_hr:
+                size_hr = (self.args.resolution_hr, self.args.resolution_hr)
+            self.dataset_lr_train = ImageMatteDataset(
+                imagematte_dir=DATA_PATHS['imagematte']['train'],
+                background_image_dir=DATA_PATHS['background_images']['train'],
+                background_video_dir=DATA_PATHS['background_videos']['train'],
+                size=self.args.resolution_lr,
+                seq_length=self.args.seq_length_lr,
+                seq_sampler=TrainFrameSampler(),
+                transform=ImageMatteAugmentation(size_lr))
+            if self.args.train_hr:
+                self.dataset_hr_train = ImageMatteDataset(
+                    imagematte_dir=DATA_PATHS['imagematte']['train'],
+                    background_image_dir=DATA_PATHS['background_images']['train'],
+                    background_video_dir=DATA_PATHS['background_videos']['train'],
+                    size=self.args.resolution_hr,
+                    seq_length=self.args.seq_length_hr,
+                    seq_sampler=TrainFrameSampler(),
+                    transform=ImageMatteAugmentation(size_hr))
+            self.dataset_valid = ImageMatteDataset(
+                imagematte_dir=DATA_PATHS['imagematte']['valid'],
+                background_image_dir=DATA_PATHS['background_images']['valid'],
+                background_video_dir=DATA_PATHS['background_videos']['valid'],
+                size=self.args.resolution_hr if self.args.train_hr else self.args.resolution_lr,
+                seq_length=self.args.seq_length_hr if self.args.train_hr else self.args.seq_length_lr,
+                seq_sampler=ValidFrameSampler(),
+                transform=ImageMatteAugmentation(size_hr if self.args.train_hr else size_lr))
+
+            # Matting dataloaders:
+            self.datasampler_lr_train = DistributedSampler(
+                dataset=self.dataset_lr_train,
+                rank=self.rank,
+                num_replicas=self.world_size,
+                shuffle=True)
+            self.dataloader_lr_train = DataLoader(
+                dataset=self.dataset_lr_train,
+                batch_size=self.args.batch_size_per_gpu,
+                num_workers=self.args.num_workers,
+                sampler=self.datasampler_lr_train,
+                pin_memory=False)
+            if self.args.train_hr:
+                self.datasampler_hr_train = DistributedSampler(
+                    dataset=self.dataset_hr_train,
+                    rank=self.rank,
+                    num_replicas=self.world_size,
+                    shuffle=True)
+                self.dataloader_hr_train = DataLoader(
+                    dataset=self.dataset_hr_train,
+                    batch_size=self.args.batch_size_per_gpu,
+                    num_workers=self.args.num_workers,
+                    sampler=self.datasampler_hr_train,
+                    pin_memory=False)
+            self.dataloader_valid = DataLoader(
+                dataset=self.dataset_valid,
+                batch_size=self.args.batch_size_per_gpu,   #1
+                num_workers=self.args.num_workers,
+                pin_memory=False)
+
     def init_model(self):
         self.log('Initializing model')
         self.model = POBEVM(self.args.model_variant, pretrained_backbone=True).to(self.rank)
@@ -342,12 +472,12 @@ class Trainer:
         self.model = nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
         self.model_ddp = DDP(self.model, device_ids=[self.rank], broadcast_buffers=False, find_unused_parameters=True)
         self.optimizer = Adam([
-            {'params': self.model.backbone.parameters(), 'lr': self.args.learning_rate_backbone},
-            {'params': self.model.lr_aspp.parameters(), 'lr': self.args.learning_rate_aspp},
-            {'params': self.model.SOBE.parameters(), 'lr': self.args.learning_rate_decoder},
-            {'params': self.model.project_mat.parameters(), 'lr': self.args.learning_rate_decoder},
-            {'params': self.model.project_seg.parameters(), 'lr': self.args.learning_rate_decoder},
-            {'params': self.model.refiner.parameters(), 'lr': self.args.learning_rate_refiner},
+            {'params': self.model.backbone.parameters(), 'lr': self.args.learning_rate_backbone[self.args.stage_start - 1]},
+            {'params': self.model.lr_aspp.parameters(), 'lr': self.args.learning_rate_aspp[self.args.stage_start - 1]},
+            {'params': self.model.SOBE.parameters(), 'lr': self.args.learning_rate_decoder[self.args.stage_start - 1]},
+            {'params': self.model.project_mat.parameters(), 'lr': self.args.learning_rate_decoder[self.args.stage_start - 1]},
+            {'params': self.model.project_seg.parameters(), 'lr': self.args.learning_rate_decoder[self.args.stage_start - 1]},
+            {'params': self.model.refiner.parameters(), 'lr': self.args.learning_rate_refiner[self.args.stage_start - 1]},
         ])
         # self.optimizer = SGD([
         #     {'params': [param for name, param in self.model_ddp.module.named_parameters() if name[-4:] == 'bias'],
@@ -363,15 +493,85 @@ class Trainer:
             self.writer = SummaryWriter(self.args.log_dir)
         
     def train(self):
-        for epoch in range(self.args.epoch_start, self.args.epoch_end):
+        if self.args.stage_start == 1:
+            self.train_stage1()
+            self.train_stage2()
+            self.train_stage3()
+            self.train_stage4()
+        elif self.args.start_stage == 2:
+            self.train_stage2()
+            self.train_stage3()
+            self.train_stage4()
+        elif self.args.start_stage == 3:
+            self.train_stage3()
+            self.train_stage4()
+        elif self.args.start_stage == 4:
+            self.train_stage4()
+
+        # for epoch in range(self.args.epoch_start, self.args.epoch_end):
+        #     self.epoch = epoch
+        #     self.step = epoch * len(self.dataloader_lr_train)
+        #
+        #     # if not self.args.disable_validation:
+        #         # self.validate()
+        #
+        #     self.log(f'Training epoch: {epoch}')
+        #     for true_fgr, true_pha, true_bgr in tqdm(self.dataloader_lr_train, disable=self.args.disable_progress_bar, dynamic_ncols=True):
+        #         # Low resolution pass
+        #         self.train_mat(true_fgr, true_pha, true_bgr, downsample_ratio=1, tag='lr')
+        #
+        #         # High resolution pass
+        #         if self.args.train_hr:
+        #             true_fgr, true_pha, true_bgr = self.load_next_mat_hr_sample()
+        #             self.train_mat(true_fgr, true_pha, true_bgr, downsample_ratio=self.args.downsample_ratio, tag='hr')
+        #
+        #         if self.step % self.args.checkpoint_save_interval == 0:
+        #             self.save()
+        #
+        #         self.step += 1
+    def train_stage1(self):
+        """
+        Args:
+            --model-variant mobilenetv3 \
+            --dataset videomatte \
+            --resolution-lr 512 \
+            --seq-length-lr 15 \
+            --learning-rate-backbone 0.0001 \
+            --learning-rate-aspp 0.0002 \
+            --learning-rate-decoder 0.0002 \
+            --learning-rate-refiner 0 \
+            --checkpoint-dir checkpoint/stage1 \
+            --log-dir log/stage1 \
+            --epoch-start 0 \
+            --epoch-end 20
+        Returns:
+
+        """
+        self.args.stage = 1
+        if self.rank == 0:
+            self.log(f'Initializing writer{self.args.stage}')
+            self.writer = SummaryWriter(self.args.log_dir +f'{self.rank}')
+            # self.writer = SummaryWriter(self.args.log_dir + f'stage{self.args.stage}' + f'/{self.rank}')
+        self.log(f'train start from {self.args.epoch_stage[0]}th epoch ')
+        self.args.train_hr = False
+        self.args.resolution_lr = 512
+        self.args.seq_length_lr = 15
+        self._get_dataset()
+        for epoch in range(self.args.epoch_stage[self.args.stage - 1], self.args.epoch_stage[self.args.stage]):
             self.epoch = epoch
             self.step = epoch * len(self.dataloader_lr_train)
-            
-            # if not self.args.disable_validation:
-                # self.validate()
-            
+
+            if self.epoch == self.args.epoch_stage[self.args.stage - 1]:
+                self.optimizer.param_groups[0]['lr'] = self.args.learning_rate_backbone[self.args.stage - 1]
+                self.optimizer.param_groups[1]['lr'] = self.args.learning_rate_aspp[self.args.stage - 1]
+                self.optimizer.param_groups[2]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[3]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[4]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[5]['lr'] = self.args.learning_rate_refiner[self.args.stage - 1]
+
             self.log(f'Training epoch: {epoch}')
-            for true_fgr, true_pha, true_bgr in tqdm(self.dataloader_lr_train, disable=self.args.disable_progress_bar, dynamic_ncols=True):
+            for true_fgr, true_pha, true_bgr in tqdm(self.dataloader_lr_train, disable=self.args.disable_progress_bar,
+                                                     dynamic_ncols=True):
                 # Low resolution pass
                 self.train_mat(true_fgr, true_pha, true_bgr, downsample_ratio=1, tag='lr')
 
@@ -379,12 +579,190 @@ class Trainer:
                 if self.args.train_hr:
                     true_fgr, true_pha, true_bgr = self.load_next_mat_hr_sample()
                     self.train_mat(true_fgr, true_pha, true_bgr, downsample_ratio=self.args.downsample_ratio, tag='hr')
-                    
+
                 if self.step % self.args.checkpoint_save_interval == 0:
                     self.save()
-                    
+
                 self.step += 1
-                
+
+    def train_stage2(self):
+        """
+        Args:
+            --model-variant mobilenetv3 \
+            --dataset videomatte \
+            --resolution-lr 512 \
+            --seq-length-lr 50 \
+            --learning-rate-backbone 0.00005 \
+            --learning-rate-aspp 0.0001 \
+            --learning-rate-decoder 0.0001 \
+            --learning-rate-refiner 0 \
+            --checkpoint checkpoint/stage1/epoch-19.pth \
+            --checkpoint-dir checkpoint/stage2 \
+            --log-dir log/stage2 \
+            --epoch-start 20 \
+            --epoch-end 22
+        Returns:
+
+        """
+        self.args.stage = 2
+        if self.rank == 0:
+            self.log(f'Initializing writer{self.args.stage}')
+            self.writer = SummaryWriter(self.args.log_dir + f'{self.rank}')
+            # self.writer = SummaryWriter(self.args.log_dir + f'stage{self.args.stage}' + f'/{self.rank}')
+        self.log(f'train start from {self.args.epoch_stage[0]}th epoch ')
+        self.args.train_hr = False
+        self.args.resolution_lr = 512
+        self.args.seq_length_lr = 50
+        self._get_dataset()
+        for epoch in range(self.args.epoch_stage[self.args.stage - 1], self.args.epoch_stage[self.args.stage]):
+            self.epoch = epoch
+            self.step = epoch * len(self.dataloader_lr_train)
+            if self.epoch == self.args.epoch_stage[self.args.stage - 1]:
+                self.optimizer.param_groups[0]['lr'] = self.args.learning_rate_backbone[self.args.stage - 1]
+                self.optimizer.param_groups[1]['lr'] = self.args.learning_rate_aspp[self.args.stage - 1]
+                self.optimizer.param_groups[2]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[3]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[4]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[5]['lr'] = self.args.learning_rate_refiner[self.args.stage - 1]
+
+            self.log(f'Training epoch: {epoch}')
+            for true_fgr, true_pha, true_bgr in tqdm(self.dataloader_lr_train, disable=self.args.disable_progress_bar,
+                                                     dynamic_ncols=True):
+                # Low resolution pass
+                self.train_mat(true_fgr, true_pha, true_bgr, downsample_ratio=1, tag='lr')
+
+                # High resolution pass
+                if self.args.train_hr:
+                    true_fgr, true_pha, true_bgr = self.load_next_mat_hr_sample()
+                    self.train_mat(true_fgr, true_pha, true_bgr, downsample_ratio=self.args.downsample_ratio, tag='hr')
+
+                if self.step % self.args.checkpoint_save_interval == 0:
+                    self.save()
+
+                self.step += 1
+
+    def train_stage3(self):
+        """
+        Args:
+            --model-variant mobilenetv3 \
+            --dataset videomatte \
+            --train-hr \
+            --resolution-lr 512 \
+            --resolution-hr 2048 \
+            --seq-length-lr 40 \
+            --seq-length-hr 6 \
+            --learning-rate-backbone 0.00001 \
+            --learning-rate-aspp 0.00001 \
+            --learning-rate-decoder 0.00001 \
+            --learning-rate-refiner 0.0002 \
+            --checkpoint checkpoint/stage2/epoch-21.pth \
+            --checkpoint-dir checkpoint/stage3 \
+            --log-dir log/stage3 \
+            --epoch-start 22 \
+            --epoch-end 23
+        Returns:
+
+        """
+        self.args.stage = 3
+        if self.rank == 0:
+            self.log(f'Initializing writer{self.args.stage}')
+            self.writer = SummaryWriter(self.args.log_dir + f'{self.rank}')
+            # self.writer = SummaryWriter(self.args.log_dir + f'stage{self.args.stage}' + f'/{self.rank}')
+        self.log(f'train start from {self.args.epoch_stage[0]}th epoch ')
+        self.args.train_hr = True
+        self.args.resolution_lr = 512
+        self.args.resolution_hr = 2048
+        self.args.seq_length_lr = 40
+        self.args.seq_length_hr = 6
+        self._get_dataset()
+        for epoch in range(self.args.epoch_stage[self.args.stage - 1], self.args.epoch_stage[self.args.stage]):
+            self.epoch = epoch
+            self.step = epoch * len(self.dataloader_lr_train)
+            if self.epoch == self.args.epoch_stage[self.args.stage - 1]:
+                self.optimizer.param_groups[0]['lr'] = self.args.learning_rate_backbone[self.args.stage - 1]
+                self.optimizer.param_groups[1]['lr'] = self.args.learning_rate_aspp[self.args.stage - 1]
+                self.optimizer.param_groups[2]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[3]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[4]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[5]['lr'] = self.args.learning_rate_refiner[self.args.stage - 1]
+
+            self.log(f'Training epoch: {epoch}')
+            for true_fgr, true_pha, true_bgr in tqdm(self.dataloader_lr_train, disable=self.args.disable_progress_bar,
+                                                     dynamic_ncols=True):
+                # Low resolution pass
+                self.train_mat(true_fgr, true_pha, true_bgr, downsample_ratio=1, tag='lr')
+
+                # High resolution pass
+                if self.args.train_hr:
+                    true_fgr, true_pha, true_bgr = self.load_next_mat_hr_sample()
+                    self.train_mat(true_fgr, true_pha, true_bgr, downsample_ratio=self.args.downsample_ratio, tag='hr')
+
+                if self.step % self.args.checkpoint_save_interval == 0:
+                    self.save()
+
+                self.step += 1
+
+    def train_stage4(self):
+        """
+        Args:
+            --model-variant mobilenetv3 \
+            --dataset imagematte \
+            --train-hr \
+            --resolution-lr 512 \
+            --resolution-hr 2048 \
+            --seq-length-lr 40 \
+            --seq-length-hr 6 \
+            --learning-rate-backbone 0.00001 \
+            --learning-rate-aspp 0.00001 \
+            --learning-rate-decoder 0.00005 \
+            --learning-rate-refiner 0.0002 \
+            --checkpoint checkpoint/stage3/epoch-22.pth \
+            --checkpoint-dir checkpoint/stage4 \
+            --log-dir log/stage4 \
+            --epoch-start 23 \
+            --epoch-end 28
+        Returns:
+
+        """
+        self.args.stage = 4
+        if self.rank == 0:
+            self.log(f'Initializing writer{self.args.stage}')
+            self.writer = SummaryWriter(self.args.log_dir + f'{self.rank}')
+            # self.writer = SummaryWriter(self.args.log_dir + f'stage{self.args.stage}' + f'/{self.rank}')
+        self.log(f'train start from {self.args.epoch_stage[0]}th epoch ')
+        self.args.train_hr = True
+        self.args.resolution_lr = 512
+        self.args.resolution_hr = 2048
+        self.args.seq_length_lr = 40
+        self.args.seq_length_hr = 6
+        self._get_dataset()
+        for epoch in range(self.args.epoch_stage[self.args.stage - 1], self.args.epoch_stage[self.args.stage]):
+            self.epoch = epoch
+            self.step = epoch * len(self.dataloader_lr_train)
+            if self.epoch == self.args.epoch_stage[self.args.stage - 1]:
+                self.optimizer.param_groups[0]['lr'] = self.args.learning_rate_backbone[self.args.stage - 1]
+                self.optimizer.param_groups[1]['lr'] = self.args.learning_rate_aspp[self.args.stage - 1]
+                self.optimizer.param_groups[2]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[3]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[4]['lr'] = self.args.learning_rate_decoder[self.args.stage - 1]
+                self.optimizer.param_groups[5]['lr'] = self.args.learning_rate_refiner[self.args.stage - 1]
+
+            self.log(f'Training epoch: {epoch}')
+            for true_fgr, true_pha, true_bgr in tqdm(self.dataloader_lr_train, disable=self.args.disable_progress_bar,
+                                                     dynamic_ncols=True):
+                # Low resolution pass
+                self.train_mat(true_fgr, true_pha, true_bgr, downsample_ratio=1, tag='lr')
+
+                # High resolution pass
+                if self.args.train_hr:
+                    true_fgr, true_pha, true_bgr = self.load_next_mat_hr_sample()
+                    self.train_mat(true_fgr, true_pha, true_bgr, downsample_ratio=self.args.downsample_ratio, tag='hr')
+
+                if self.step % self.args.checkpoint_save_interval == 0:
+                    self.save()
+
+                self.step += 1
+
     def train_mat(self, true_fgr, true_pha, true_bgr, downsample_ratio, tag):
         """
         Args:
@@ -425,9 +803,13 @@ class Trainer:
             '''edge loss'''
             edge_loss,P_dege, T_edge = matting_pha_edge_loss(pred_pha, true_pha)#['pha_edge']
             # TODO can't add edge_loss in 1 train step
-            loss = loss_pha4['pha_total_loss'] + loss_pha3['pha_total_loss'] + 2 * loss_pha2['pha_total_loss']\
-                  + 4 * loss_pha1['pha_total_loss'] + 8 * loss_pha0['pha_total_loss']+ 8 * loss_fgr['fgr_total_loss'] \
-                    + 32 * edge_loss['pha_edge']
+            if self.args.stage == 1:
+                loss = loss_pha4['pha_total_loss'] + loss_pha3['pha_total_loss'] + 2 * loss_pha2['pha_total_loss']\
+                      + 4 * loss_pha1['pha_total_loss'] + 8 * loss_pha0['pha_total_loss']+ 8 * loss_fgr['fgr_total_loss']
+            else:
+                loss = loss_pha4['pha_total_loss'] + loss_pha3['pha_total_loss'] + 2 * loss_pha2['pha_total_loss']\
+                      + 4 * loss_pha1['pha_total_loss'] + 8 * loss_pha0['pha_total_loss']+ 8 * loss_fgr['fgr_total_loss'] \
+                        + 32 * edge_loss['pha_edge']
 
         # self.scaler.scale(loss['total']).backward()
         self.scaler.scale(loss).backward()
@@ -554,7 +936,7 @@ class Trainer:
     def save(self):
         if self.rank == 0:
             os.makedirs(self.args.checkpoint_dir, exist_ok=True)
-            torch.save(self.model.state_dict(), os.path.join(self.args.checkpoint_dir, f'epoch-{self.epoch}.pth'))
+            torch.save(self.model.state_dict(), os.path.join(self.args.checkpoint_dir, str(self.args.stage), f'epoch-{self.epoch}.pth'))
             self.log('Model saved')
         dist.barrier()
         

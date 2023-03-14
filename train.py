@@ -370,7 +370,7 @@ class Trainer:
                     self.save()
                     
                 self.step += 1
-                
+
     def train_mat(self, true_fgr, true_pha, true_bgr, downsample_ratio, tag):
         true_fgr = true_fgr.to(self.rank, non_blocking=True)
         true_pha = true_pha.to(self.rank, non_blocking=True)
